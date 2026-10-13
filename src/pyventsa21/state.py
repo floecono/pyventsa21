@@ -47,7 +47,7 @@ from .registers import (
 )
 
 # Below this indoor/outdoor difference the efficiency figure is only noise.
-_MIN_EFFICIENCY_DELTA = 5.0
+_MIN_EFFICIENCY_DELTA = 4.0
 
 
 class OperationMode(IntEnum):
