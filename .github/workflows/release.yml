@@ -1,0 +1,28 @@
+name: Release
+
+# Publishes to PyPI when a GitHub release is published.
+# Uses PyPI "trusted publishing": no password or token is stored anywhere.
+# One-time setup on pypi.org: add this repository and this workflow file
+# (release.yml, environment "pypi") as a trusted publisher of pyventsa21.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
