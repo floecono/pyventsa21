@@ -7,6 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from .modbus import (
     EXC_ILLEGAL_DATA_ADDRESS,
@@ -84,10 +85,18 @@ def _check(write: Write) -> None:
 class A21Client:
     """Serialised access to one A21 controller.
 
-    Each call opens its own short TCP connection. The controller only accepts
-    one client per network interface and long-lived connections are known to
-    go stale, so the socket is never kept between calls. Calls made
-    concurrently are queued.
+    Two modes. With ``keep_connection`` (the default) one TCP connection is
+    kept across calls; stray AT text leaked by the Wi-Fi module is skipped
+    without closing it, and the kernel keepalive notices a dead peer. Call
+    :meth:`close` (or use the client as an async context manager) when done.
+    Without it, a connection is opened for each call and closed right after,
+    the way the manufacturer's own tools talk to the unit.
+
+    The controller accepts a single TCP client per network interface, so
+    calls made concurrently on one client are queued. Closing and reopening
+    the connection at every hiccup is what made the module freeze (firmware
+    0.43, 2026-10): whichever mode is used, the connection is only dropped
+    when the unit stops answering.
 
     Every method raises ``A21ConnectionError`` when the unit cannot be
     reached, and ``A21RequestRefused`` when it rejects a value.
@@ -100,25 +109,65 @@ class A21Client:
         unit_id: int = DEFAULT_UNIT_ID,
         *,
         timeout: float = 5.0,
+        keep_connection: bool = True,
     ) -> None:
         """Describe the unit to talk to; nothing is sent yet."""
         self.host = host
         self.port = port
         self.unit_id = unit_id
+        self.keep_connection = keep_connection
         self._modbus = ModbusTcpClient(host, port, unit_id, timeout)
         self._lock = asyncio.Lock()
         # Number of readable addresses per table, learnt on older firmware.
         self._limits: dict[str, int] = {}
 
+    async def __aenter__(self) -> A21Client:
+        """Return the client; the connection opens on the first call."""
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """Close the connection."""
+        await self.close()
+
+    @property
+    def connected(self) -> bool:
+        """Return True while a TCP connection is open."""
+        return self._modbus.connected
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """Return the connection counters, for diagnostics and bug reports.
+
+        connections, connection_age_s, requests, no_answer, stray_events,
+        stray_bytes and last_stray (the latest text the module leaked).
+        """
+        return self._modbus.stats.as_dict()
+
+    async def close(self) -> None:
+        """Close the connection; the next call opens a new one."""
+        async with self._lock:
+            await self._modbus.close()
+
+    async def _release(self) -> None:
+        """Drop the connection after a call, unless it is kept."""
+        if not self.keep_connection:
+            await self._modbus.close()
+
     # --- reading ------------------------------------------------------------
     async def identify(self) -> int:
-        """Return the controller type register (1 for an A21)."""
+        """Return the controller type register (1 for an A21).
+
+        A connection opened just for this is closed again; the kept
+        connection of a running client is left as it is.
+        """
         async with self._lock:
+            opened = not self._modbus.connected
             await self._connect()
             try:
                 return (await self._modbus.read_input_registers(IR_DEVICE_TYPE, 1))[0]
             finally:
-                await self._modbus.close()
+                if opened:
+                    await self._modbus.close()
 
     async def is_a21(self) -> bool:
         """Return True when an A21 controller answers at this address."""
@@ -129,9 +178,11 @@ class A21Client:
         async with self._lock:
             await self._connect()
             try:
+                # On a transport or protocol error the Modbus client drops
+                # the socket itself; the next call opens a fresh one.
                 return await self._read_all()
             finally:
-                await self._modbus.close()
+                await self._release()
 
     # --- writing ------------------------------------------------------------
     async def write(self, *writes: Write) -> A21State:
@@ -149,7 +200,7 @@ class A21Client:
                 await asyncio.sleep(_SETTLE_DELAY)
                 return await self._read_all()
             finally:
-                await self._modbus.close()
+                await self._release()
 
     async def write_coil(self, address: int, value: bool) -> A21State:
         """Write one coil, then return the state read back."""

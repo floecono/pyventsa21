@@ -139,7 +139,64 @@ async def test_one_connection_at_a_time(
     """The controller accepts one TCP client: concurrent calls are queued."""
     await asyncio.gather(*(client.read_state() for _ in range(5)), client.set_speed(1))
     assert simulator.refused == 0
-    assert simulator.connections == 6
+    assert simulator.connections == 1 and client.connected
+    assert client.stats["connections"] == 1
+    assert client.stats["requests"] == 4 * 6 + 1
+    await client.close()
+    assert not client.connected and client.stats["connection_age_s"] is None
+
+
+async def test_connection_per_call(simulator: A21Simulator) -> None:
+    """Without keep_connection, every call opens and closes its own socket."""
+    client = A21Client("127.0.0.1", simulator.port, keep_connection=False)
+    await asyncio.gather(*(client.read_state() for _ in range(5)), client.set_speed(1))
+    assert simulator.refused == 0
+    assert simulator.connections == 6 and not client.connected
+
+
+async def test_context_manager(simulator: A21Simulator) -> None:
+    async with A21Client("127.0.0.1", simulator.port) as client:
+        await client.read_state()
+        assert client.connected
+    assert not client.connected
+
+
+async def test_identify_leaves_a_kept_connection(
+    client: A21Client, simulator: A21Simulator
+) -> None:
+    assert await client.identify() == 1
+    assert not client.connected  # opened for the question, closed after
+    await client.read_state()
+    assert await client.identify() == 1
+    assert client.connected and simulator.connections == 2
+
+
+async def test_stray_bytes_are_skipped(
+    client: A21Client, simulator: A21Simulator
+) -> None:
+    """AT commands leaked into the stream are dropped; the connection is kept."""
+    await client.read_state()
+    simulator.stray = b"AT+RFPOWER=78\r\nOK\r\n"
+    state = await client.read_state()
+    assert state.outdoor_temperature == 6.3
+    assert simulator.connections == 1
+    stats = client.stats
+    assert stats["stray_events"] == 1
+    assert stats["stray_bytes"] == len(b"AT+RFPOWER=78\r\nOK\r\n")
+    assert stats["last_stray"].startswith("AT+RFPOWER")
+
+
+async def test_frozen_module(simulator: A21Simulator) -> None:
+    """A module that accepts the connection but never answers is a lost one."""
+    client = A21Client("127.0.0.1", simulator.port, timeout=0.3)
+    await client.read_state()
+    simulator.frozen = True
+    with pytest.raises(A21ConnectionError):
+        await client.read_state()
+    assert not client.connected and client.stats["no_answer"] == 1
+    simulator.frozen = False
+    await client.read_state()
+    assert client.stats["connections"] == 2
 
 
 async def test_older_firmware() -> None:

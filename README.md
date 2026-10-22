@@ -40,15 +40,63 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Every call opens a short TCP connection and closes it. The controller accepts
-a single Modbus TCP client per network interface, so the library never keeps
-the connection; concurrent calls on one `A21Client` are queued.
+### Connection
+
+By default one TCP connection is kept across calls (`keep_connection=True`);
+close it with `await client.close()` or use the client as an async context
+manager. With `keep_connection=False` every call opens a short connection
+and closes it, the way the manufacturer's tools do. The controller accepts a
+single Modbus TCP client per network interface, so concurrent calls on one
+`A21Client` are queued.
+
+The Wi-Fi module of the unit sometimes leaks the AT commands of its own
+radio chip (`AT+CIPSEND`, `AT+RFPOWER`…) into the Modbus stream. The library
+skips that text instead of dropping the connection: closing and reopening at
+every leak made the module freeze (firmware 0.43, 2026-10), to the point of
+needing a power cycle. TCP keepalive is enabled so a dead peer is noticed
+within about a minute. `client.stats` returns counters for bug reports:
+connections, connection age, requests, lost answers, stray events and the
+latest stray text.
+
+### Identifier and liveness (protocol of the app)
+
+The Modbus table has no serial number. The module also speaks the UDP
+protocol of the manufacturer's app (port 4000), read-only here:
+
+```python
+from pyventsa21 import async_read_identifier, async_probe
+
+await async_read_identifier("192.168.1.50", "1111")  # "0020003A3032510E"
+await async_probe("192.168.1.50", "1111")
+# {"identifier": "0020003A3032510E", "device_type": "1", "firmware": "0.43 (28/06/2024)"}
+```
+
+`async_probe` is meant for when Modbus stops answering: a module that still
+answers here is alive and only its Modbus path is stuck; one silent here too
+is frozen and needs a power cycle. Do not send a UDP question while a Modbus
+request is in flight: the module answers neither.
 
 ### State
 
 `read_state()` returns an `A21State`. Its properties decode the common
 values (`is_on`, `operation_mode`, `speed`, the four air temperatures,
 `efficiency`, `bypass_position`, `filter_state`, `alarms`, `firmware`…).
+
+The exchanger is described from the four air temperatures:
+
+- `efficiency`: supply-side ratio (supply − outdoor) / (extract − outdoor),
+  in percent, `None` when it cannot be measured; `efficiency_status` says
+  why (`off`, `bypass`, `heating`, `cooling`, `preheating`, `defrosting`,
+  `small_difference`, `no_probe`).
+- `efficiency_exhaust_side`: (extract − exhaust) / (extract − outdoor).
+  Equal to the supply-side figure with balanced flows.
+- `flow_ratio`: apparent extract/supply flow ratio from the heat balance,
+  the ratio of the real flows whatever the fan settings; it follows filter
+  clogging. 1.0 is balanced.
+- `dew_point` of the extract air (from `humidity`, internal or external
+  probe) and `condensation_likely` in the exchanger. Condensation releases
+  latent heat on the extract side and lowers the exhaust-side figures.
+- `defrosting`: the supply fan is stopped while the extract fan runs.
 
 Everything else is available raw, by Modbus address, with the constants of
 `pyventsa21.registers`:
@@ -93,11 +141,30 @@ clears by itself.
 ## Status
 
 Written from the VENTS document "Modbus table for connecting A21 automation
-to BMS" (V55-8-1EN-02) and tested against a simulator of the controller
-(`tests/simulator.py`). It has not been validated on a real unit yet; the byte
-order of the multi-byte registers (timers, clock, firmware version) follows
-the one documented by [pybls21](https://github.com/jvitkauskas/pybls21) for
-the related Blauberg S21 controller.
+to BMS" (V55-8-1EN-02), tested against a simulator of the controller
+(`tests/simulator.py`) and in daily use on an ECONOPRIME DF 350 Connect
+(A21 firmware 0.43) through the
+[Home Assistant integration](https://github.com/floecono/ha-vents-A21). The
+byte order of the multi-byte registers (timers, clock, firmware version)
+follows the one documented by [pybls21](https://github.com/jvitkauskas/pybls21)
+for the related Blauberg S21 controller.
+
+## Changes
+
+### 0.2.0
+
+- Connection kept across calls by default; stray AT text leaked by the
+  Wi-Fi module skipped instead of closing the connection; TCP keepalive;
+  `stats` counters; `close()` and async context manager.
+- Protocol of the app (UDP 4000, read-only): `async_read_identifier`,
+  `async_probe`.
+- `A21State`: `efficiency_status`, `efficiency_exhaust_side`, `flow_ratio`,
+  `dew_point`, `condensation_likely`, `defrosting`; `humidity` falls back to
+  the external probe.
+
+### 0.1.0
+
+- First release.
 
 ## Development
 

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 
 from .alarms import Alarm, Severity, describe_alarm
 from .registers import (
@@ -26,11 +27,14 @@ from .registers import (
     IR_ALARM,
     IR_BYPASS_STATE,
     IR_DEVICE_TYPE,
+    IR_EXTRACT_RPM,
     IR_FILTER_DAYS,
     IR_FILTER_STATE,
     IR_FIRMWARE,
     IR_PREHEATER_OUTPUT,
+    IR_RH_EXT,
     IR_RH_INT,
+    IR_SUPPLY_RPM,
     IR_TEMP_EXHAUST,
     IR_TEMP_EXTRACT,
     IR_TEMP_OUTDOOR,
@@ -46,8 +50,37 @@ from .registers import (
     TEMP_SHORT_CIRCUIT,
 )
 
-# Below this indoor/outdoor difference the efficiency figure is only noise.
-_MIN_EFFICIENCY_DELTA = 4.0
+# Below this indoor/outdoor difference the efficiency figure is only noise:
+# the error of the three probes is divided by that difference.
+MIN_EFFICIENCY_DELTA = 4.0
+# Without a humidity probe, exhaust air this cold is taken to be condensing:
+# the dew point of indoor air in winter sits between 6 and 10 °C.
+CONDENSATION_GUESS_BELOW = 8.0
+# Margin under the dew point: the plates are colder than the air leaving them.
+CONDENSATION_MARGIN = 1.0
+
+
+class EfficiencyStatus(StrEnum):
+    """Why the heat recovery efficiency can or cannot be worked out.
+
+    The exchanger keeps recovering heat in the HEATING, COOLING, PREHEATING
+    and SMALL_DIFFERENCE cases: only the figure is missing, because
+    something else changes the supply temperature or because indoor and
+    outdoor air are too close to measure it.
+    """
+
+    MEASURED = "measured"
+    OFF = "off"
+    NO_PROBE = "no_probe"
+    BYPASS = "bypass"
+    HEATING = "heating"
+    COOLING = "cooling"
+    PREHEATING = "preheating"
+    # The supply fan is stopped while the extract fan runs: frost protection
+    # by fan stop, or its second stage behind a bypass that does not cope.
+    # The supply probe then sees still air and every figure is meaningless.
+    DEFROSTING = "defrosting"
+    SMALL_DIFFERENCE = "small_difference"
 
 
 class OperationMode(IntEnum):
@@ -234,8 +267,57 @@ class A21State:
 
     @property
     def humidity(self) -> int | None:
-        """Return the humidity of the main probe, None without one."""
-        return self.inputs[IR_RH_INT] or None
+        """Return the humidity of the extract air, from either probe, or None.
+
+        The internal probe comes first, then the external one (input 11)
+        when the internal one is absent or reads 0.
+        """
+        for address in (IR_RH_INT, IR_RH_EXT):
+            value = self.inputs[address]
+            if value:
+                return value
+        return None
+
+    @property
+    def temperature_difference(self) -> float | None:
+        """Return the gap between extract and outdoor air, in °C."""
+        outdoor = self.outdoor_temperature
+        extract = self.extract_temperature
+        if outdoor is None or extract is None:
+            return None
+        return round(abs(extract - outdoor), 1)
+
+    @property
+    def defrosting(self) -> bool:
+        """Return True while the supply fan is stopped and the extract fan runs.
+
+        Frost protection by fan stop, or the second stage the firmware adds
+        behind a bypass that does not cope. Only known with tachometers.
+        """
+        supply, extract = self.inputs[IR_SUPPLY_RPM], self.inputs[IR_EXTRACT_RPM]
+        return bool(extract) and supply == 0
+
+    @property
+    def efficiency_status(self) -> EfficiencyStatus:
+        """Say whether the efficiency can be worked out, and if not, why."""
+        difference = self.temperature_difference
+        if difference is None or self.supply_temperature is None:
+            return EfficiencyStatus.NO_PROBE
+        if not self.is_on:
+            return EfficiencyStatus.OFF
+        if self.inputs[IR_BYPASS_STATE]:
+            return EfficiencyStatus.BYPASS
+        if self.discrete[DI_STATUS_HEATER]:
+            return EfficiencyStatus.HEATING
+        if self.discrete[DI_STATUS_COOLER]:
+            return EfficiencyStatus.COOLING
+        if self.inputs[IR_PREHEATER_OUTPUT]:
+            return EfficiencyStatus.PREHEATING
+        if self.defrosting:
+            return EfficiencyStatus.DEFROSTING
+        if difference < MIN_EFFICIENCY_DELTA:
+            return EfficiencyStatus.SMALL_DIFFERENCE
+        return EfficiencyStatus.MEASURED
 
     @property
     def efficiency(self) -> int | None:
@@ -243,21 +325,105 @@ class A21State:
 
         (supply - outdoor) / (extract - outdoor). Only meaningful while the
         exchanger alone changes the supply temperature, so nothing is
-        reported when a heater or cooler runs or when the bypass is open.
+        reported when a heater or cooler runs, when the bypass is open or
+        when indoor and outdoor air are too close: see efficiency_status.
         """
         outdoor = self.outdoor_temperature
         supply = self.supply_temperature
         extract = self.extract_temperature
-        if outdoor is None or supply is None or extract is None or not self.is_on:
+        if (
+            outdoor is None
+            or supply is None
+            or extract is None
+            or self.efficiency_status is not EfficiencyStatus.MEASURED
+        ):
             return None
-        if self.discrete[DI_STATUS_HEATER] or self.discrete[DI_STATUS_COOLER]:
+        ratio = (supply - outdoor) / (extract - outdoor)
+        return round(min(max(ratio, 0.0), 1.0) * 100)
+
+    @property
+    def efficiency_exhaust_side(self) -> int | None:
+        """Return the exhaust-side temperature ratio in percent.
+
+        (extract - exhaust) / (extract - outdoor): how much of its heat the
+        extract air gave up. Equal to the supply-side figure with balanced
+        flows; the two drift apart when they are not. Condensation on the
+        extract side (latent heat) lowers it: see condensation_likely.
+        """
+        outdoor = self.outdoor_temperature
+        extract = self.extract_temperature
+        exhaust = self.exhaust_temperature
+        if (
+            outdoor is None
+            or extract is None
+            or exhaust is None
+            or self.efficiency_status is not EfficiencyStatus.MEASURED
+        ):
             return None
-        if self.inputs[IR_BYPASS_STATE] or self.inputs[IR_PREHEATER_OUTPUT]:
+        ratio = (extract - exhaust) / (extract - outdoor)
+        return round(min(max(ratio, 0.0), 1.0) * 100)
+
+    @property
+    def flow_ratio(self) -> float | None:
+        """Return the apparent extract/supply flow ratio from the four probes.
+
+        The heat the extract air gives up is the heat the supply air takes:
+        extract flow x (extract - exhaust) = supply flow x (supply - outdoor),
+        so the ratio of the flows is the ratio of the temperature rises. It
+        is the ratio of the real flows, whatever the fan settings, and it
+        follows filter clogging. Only sensible heat is counted: with
+        condensation on the extract side the figure comes out low (see
+        condensation_likely). None when the efficiency is not measurable or
+        when the exhaust-side drop is too small to divide by.
+        """
+        outdoor = self.outdoor_temperature
+        supply = self.supply_temperature
+        extract = self.extract_temperature
+        exhaust = self.exhaust_temperature
+        if (
+            outdoor is None
+            or supply is None
+            or extract is None
+            or exhaust is None
+            or self.efficiency_status is not EfficiencyStatus.MEASURED
+        ):
             return None
-        delta = extract - outdoor
-        if abs(delta) < _MIN_EFFICIENCY_DELTA:
+        given_up = extract - exhaust
+        taken = supply - outdoor
+        if given_up < 1.0 or taken < 0:
             return None
-        return round(min(max((supply - outdoor) / delta, 0.0), 1.0) * 100)
+        return round(taken / given_up, 2)
+
+    @property
+    def dew_point(self) -> float | None:
+        """Return the dew point of the extract air in °C (Magnus formula).
+
+        None without a humidity probe.
+        """
+        extract = self.extract_temperature
+        humidity = self.humidity
+        if extract is None or humidity is None:
+            return None
+        a, b = 17.62, 243.12
+        gamma = math.log(humidity / 100) + a * extract / (b + extract)
+        return round(b * gamma / (a - gamma), 1)
+
+    @property
+    def condensation_likely(self) -> bool | None:
+        """Return whether the extract air is condensing in the exchanger.
+
+        With a humidity probe: the exhaust air is at or under the dew point
+        of the extract air (plus a margin, the plates being colder than the
+        air leaving them). Without one: the exhaust air is simply cold.
+        None without an exhaust probe.
+        """
+        exhaust = self.exhaust_temperature
+        if exhaust is None:
+            return None
+        dew_point = self.dew_point
+        if dew_point is None:
+            return exhaust < CONDENSATION_GUESS_BELOW
+        return exhaust < dew_point + CONDENSATION_MARGIN
 
     # --- exchanger ----------------------------------------------------------
     @property

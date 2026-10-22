@@ -10,7 +10,11 @@ Only the functions the A21 controller needs are implemented
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
+import time
+from dataclasses import dataclass, field
+from typing import Any
 
 FC_READ_COILS = 0x01
 FC_READ_DISCRETE_INPUTS = 0x02
@@ -25,6 +29,45 @@ EXC_ILLEGAL_DATA_VALUE = 3
 
 _MBAP = struct.Struct(">HHHB")
 _MAX_PDU = 253
+# Stray bytes tolerated in front of an answer before the connection is
+# considered lost. The Wi-Fi module of the A21 sometimes leaks the AT
+# commands of its controller ("AT+CIPSEND", "AT+RFPOWER"...) into the
+# stream; a few dozen bytes at most.
+_MAX_STRAY = 256
+# TCP keepalive: a dead peer is noticed within about a minute.
+_KEEPALIVE_IDLE = 30
+_KEEPALIVE_INTERVAL = 10
+_KEEPALIVE_COUNT = 3
+
+
+@dataclass
+class ConnectionStats:
+    """What happened on the wire, for diagnostics and bug reports."""
+
+    connections: int = 0
+    connected_since: float | None = None
+    requests: int = 0
+    no_answer: int = 0
+    stray_events: int = 0
+    stray_bytes: int = 0
+    last_stray: bytes = field(default=b"", repr=False)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the counters as plain values."""
+        age = (
+            None
+            if self.connected_since is None
+            else round(time.monotonic() - self.connected_since)
+        )
+        return {
+            "connections": self.connections,
+            "connection_age_s": age,
+            "requests": self.requests,
+            "no_answer": self.no_answer,
+            "stray_events": self.stray_events,
+            "stray_bytes": self.stray_bytes,
+            "last_stray": self.last_stray.decode(errors="replace"),
+        }
 
 
 class A21Error(Exception):
@@ -67,6 +110,7 @@ class ModbusTcpClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._transaction = 0
+        self.stats = ConnectionStats()
 
     @property
     def connected(self) -> bool:
@@ -87,10 +131,14 @@ class ModbusTcpClient:
             raise A21ConnectionError(
                 f"Cannot connect to {self.host}:{self.port}: {err or type(err).__name__}"
             ) from err
+        self.stats.connections += 1
+        self.stats.connected_since = time.monotonic()
+        _set_keepalive(self._writer.get_extra_info("socket"))
 
     async def close(self) -> None:
         """Close the TCP connection."""
         writer, self._reader, self._writer = self._writer, None, None
+        self.stats.connected_since = None
         if writer is None:
             return
         writer.close()
@@ -107,24 +155,22 @@ class ModbusTcpClient:
         assert self._reader is not None and self._writer is not None
 
         self._transaction = (self._transaction + 1) & 0xFFFF
+        self.stats.requests += 1
         frame = _MBAP.pack(self._transaction, 0, len(pdu) + 1, self.unit_id) + pdu
         try:
             async with asyncio.timeout(self.timeout):
                 self._writer.write(frame)
                 await self._writer.drain()
                 while True:
-                    header = await self._reader.readexactly(_MBAP.size)
-                    transaction, protocol, length, _unit = _MBAP.unpack(header)
-                    if protocol != 0 or not 2 <= length <= _MAX_PDU + 1:
-                        raise A21ProtocolError(
-                            f"Invalid Modbus TCP header: {header.hex()}"
-                        )
+                    header = await self._read_header()
+                    transaction, _protocol, length, _unit = _MBAP.unpack(header)
                     answer = await self._reader.readexactly(length - 1)
                     # A late answer to a request that timed out earlier would
                     # carry an older transaction id: drop it and keep reading.
                     if transaction == self._transaction:
                         break
         except (OSError, TimeoutError, asyncio.IncompleteReadError) as err:
+            self.stats.no_answer += 1
             await self.close()
             raise A21ConnectionError(
                 f"No answer from {self.host}:{self.port}: {err or type(err).__name__}"
@@ -142,6 +188,40 @@ class ModbusTcpClient:
                 f"Unexpected function {answer[0]} in answer to {function}"
             )
         return answer
+
+    async def _read_header(self) -> bytes:
+        """Return the next MBAP header, skipping stray bytes in front of it.
+
+        The Wi-Fi module occasionally leaks text meant for its own modem
+        ("AT+CIPSEND", "AT+RFPOWER") into the Modbus stream. Those bytes
+        never form a valid header (protocol id 0, sane length, our unit id,
+        a transaction id we have used), so the stream is slid one byte at a
+        time until a header fits. Closing the connection on such a leak
+        makes the controller redo its fragile modem set-up for nothing.
+        """
+        assert self._reader is not None
+        header = await self._reader.readexactly(_MBAP.size)
+        skipped = b""
+        while True:
+            transaction, protocol, length, unit = _MBAP.unpack(header)
+            if (
+                protocol == 0
+                and 2 <= length <= _MAX_PDU + 1
+                and unit == self.unit_id
+                and transaction <= self._transaction
+            ):
+                break
+            if len(skipped) >= _MAX_STRAY:
+                raise A21ProtocolError(
+                    f"No Modbus TCP header in {skipped[:32].hex()}..."
+                )
+            skipped += header[:1]
+            header = header[1:] + await self._reader.readexactly(1)
+        if skipped:
+            self.stats.stray_events += 1
+            self.stats.stray_bytes += len(skipped)
+            self.stats.last_stray = skipped
+        return header
 
     async def _read_bits(self, function: int, address: int, count: int) -> list[bool]:
         answer = await self._request(struct.pack(">BHH", function, address, count))
@@ -190,3 +270,21 @@ class ModbusTcpClient:
         await self._request(
             struct.pack(">BHH", FC_WRITE_SINGLE_REGISTER, address, value & 0xFFFF)
         )
+
+
+def _set_keepalive(sock: socket.socket | None) -> None:
+    """Ask the kernel to probe an idle connection, so a dead peer is noticed."""
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (
+            ("TCP_KEEPIDLE", _KEEPALIVE_IDLE),
+            ("TCP_KEEPINTVL", _KEEPALIVE_INTERVAL),
+            ("TCP_KEEPCNT", _KEEPALIVE_COUNT),
+        ):
+            option = getattr(socket, name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+    except OSError:
+        pass

@@ -6,6 +6,7 @@ from pyventsa21 import (
     ALARM_CODES,
     A21Client,
     BypassMode,
+    EfficiencyStatus,
     FilterState,
     Severity,
     describe_alarm,
@@ -54,15 +55,69 @@ async def test_temperatures(client: A21Client, simulator: A21Simulator) -> None:
 
 async def test_efficiency(client: A21Client, simulator: A21Simulator) -> None:
     # (19.2 - 6.3) / (21.4 - 6.3) = 85.4 %
-    assert (await client.read_state()).efficiency == 85
+    state = await client.read_state()
+    assert state.efficiency == 85
+    assert state.efficiency_status is EfficiencyStatus.MEASURED
+    # Exhaust side: (21.4 - 8.9) / (21.4 - 6.3) = 82.8 %
+    assert state.efficiency_exhaust_side == 83
+    # Apparent flow ratio: (19.2 - 6.3) / (21.4 - 8.9) = 1.03
+    assert state.flow_ratio == 1.03
+
     simulator.set_input(51, 100)  # bypass open
-    assert (await client.read_state()).efficiency is None
+    state = await client.read_state()
+    assert (
+        state.efficiency is None and state.efficiency_status is EfficiencyStatus.BYPASS
+    )
+    assert state.efficiency_exhaust_side is None and state.flow_ratio is None
     simulator.set_input(51, 0)
     simulator.set_temperature(1, 19.0)  # outdoor almost as warm as indoor
-    assert (await client.read_state()).efficiency is None
+    state = await client.read_state()
+    assert state.efficiency is None
+    assert state.efficiency_status is EfficiencyStatus.SMALL_DIFFERENCE
     simulator.set_temperature(1, 6.3)
     simulator.set_coil(0, False)  # unit off
-    assert (await client.read_state()).efficiency is None
+    state = await client.read_state()
+    assert state.efficiency is None and state.efficiency_status is EfficiencyStatus.OFF
+    simulator.set_coil(0, True)
+    simulator.set_input(23, 0)  # supply fan stopped, extract fan running
+    state = await client.read_state()
+    assert state.defrosting
+    assert state.efficiency is None
+    assert state.efficiency_status is EfficiencyStatus.DEFROSTING
+    simulator.set_input(23, 1480)
+    simulator.set_input(2, 0x8000)  # no supply probe
+    assert (await client.read_state()).efficiency_status is EfficiencyStatus.NO_PROBE
+
+
+async def test_unbalanced_flows(client: A21Client, simulator: A21Simulator) -> None:
+    """Twice as much extract as supply: the supply side looks better than it is."""
+    simulator.set_temperature(2, 20.0)  # supply warmed almost to indoor
+    simulator.set_temperature(4, 14.5)  # exhaust gave up little
+    state = await client.read_state()
+    assert state.efficiency == 91
+    assert state.efficiency_exhaust_side == 46
+    assert state.flow_ratio == 1.99
+
+
+async def test_condensation(client: A21Client, simulator: A21Simulator) -> None:
+    # Extract 21.4 °C at 47 % RH: dew point 9.6 °C; exhaust 8.9 °C condenses.
+    state = await client.read_state()
+    assert state.dew_point == 9.6
+    assert state.condensation_likely is True
+    simulator.set_temperature(4, 11.0)
+    assert (await client.read_state()).condensation_likely is False
+    # Without a humidity probe, cold exhaust air is taken to be condensing.
+    simulator.set_input(10, 0)
+    state = await client.read_state()
+    assert state.dew_point is None and state.condensation_likely is False
+    simulator.set_temperature(4, 7.5)
+    assert (await client.read_state()).condensation_likely is True
+    # The external probe (input 11) stands in for the internal one.
+    simulator.set_input(11, 60)
+    state = await client.read_state()
+    assert state.humidity == 60 and state.dew_point == 13.3
+    simulator.set_input(4, 0x8000)  # no exhaust probe
+    assert (await client.read_state()).condensation_likely is None
 
 
 async def test_bypass(client: A21Client, simulator: A21Simulator) -> None:

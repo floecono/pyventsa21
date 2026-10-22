@@ -129,6 +129,11 @@ class A21Simulator:
         self.single_client = single_client
         self.connections = 0
         self.refused = 0
+        # Text sent in front of the next answer, like the Wi-Fi module of the
+        # real unit leaking the AT commands of its controller.
+        self.stray: bytes = b""
+        # Accept connections but never answer: the frozen module.
+        self.frozen = False
         self.requests: list[tuple[int, int, int]] = []
         self._clients: set[asyncio.StreamWriter] = set()
         self._server: asyncio.Server | None = None
@@ -160,9 +165,14 @@ class A21Simulator:
                 header = await reader.readexactly(7)
                 transaction, _protocol, length, unit = struct.unpack(">HHHB", header)
                 pdu = await reader.readexactly(length - 1)
+                if self.frozen:
+                    continue
                 answer = self._handle(pdu)
+                stray, self.stray = self.stray, b""
                 writer.write(
-                    struct.pack(">HHHB", transaction, 0, len(answer) + 1, unit) + answer
+                    stray
+                    + struct.pack(">HHHB", transaction, 0, len(answer) + 1, unit)
+                    + answer
                 )
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):

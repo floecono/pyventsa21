@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyventsa21"
-version = "0.1.0"
+version = "0.2.0"
 description = "Control ventilation units with the VENTS A21 controller over Modbus TCP"
 readme = "README.md"
 license = "MIT"
